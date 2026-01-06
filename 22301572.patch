@@ -1,0 +1,401 @@
+diff --git a/Makefile b/Makefile
+index b262c0a..ad8e2fa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,9 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_addDemo\
++	$U/_add_with_arg\
++	$U/_test_scheduler\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -166,7 +169,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..e08a63c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -14,6 +14,28 @@ struct proc *initproc;
+ 
+ int nextpid = 1;
+ struct spinlock pid_lock;
++unsigned long rand_next = 1;
++
++int
++do_rand(unsigned long *ctx)
++{
++  long hi, lo, x;
++  x = (*ctx % 0x7ffffffe) + 1;
++  hi = x / 127773;
++  lo = x % 127773;
++  x = 16807 * lo - 2836 * hi;
++  if (x < 0)
++    x += 0x7fffffff;
++  x--;
++  *ctx = x;
++  return (x);
++}
++
++int
++rand(void)
++{
++  return (do_rand(&rand_next));
++}
+ 
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+@@ -146,6 +168,9 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  p->rounds = 0;
++  p->tickets = 0;
++
+   return p;
+ }
+ 
+@@ -226,6 +251,9 @@ userinit(void)
+   
+   p->cwd = namei("/");
+ 
++  p->tickets = 10;
++  p->rounds = 0;
++
+   p->state = RUNNABLE;
+ 
+   release(&p->lock);
+@@ -299,6 +327,8 @@ kfork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
++  np->tickets = p->tickets;
++  np->rounds = 0;
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
+@@ -429,35 +459,46 @@ scheduler(void)
+ 
+   c->proc = 0;
+   for(;;){
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    int total_tickets = 0;
++    int runnable_exists = 0;
++    for(p = proc; p < &proc[NPROC]; p++){
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++      if(p->state == RUNNABLE){
++        runnable_exists = 1;
++        if(p->tickets > 0)
++          total_tickets += p->tickets;
+       }
+       release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
++
++    if(total_tickets == 0){
++      if(!runnable_exists){
++        asm volatile("wfi");
++      }
++      continue;
++    }
++
++    int winning_ticket = rand() % total_tickets;
++    int cumulative = 0;
++
++    for(p = proc; p < &proc[NPROC]; p++){
++      acquire(&p->lock);
++      if(p->state == RUNNABLE && p->tickets > 0){
++        cumulative += p->tickets;
++        if(cumulative > winning_ticket){
++          p->state = RUNNING;
++          p->rounds++;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++          c->proc = 0;
++          release(&p->lock);
++          break;
++        }
++      }
++      release(&p->lock);
+     }
+   }
+ }
+@@ -684,7 +725,6 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
+-    printf("\n");
++    printf("%d %s %s %d\n", p->pid, state, p->name, p->rounds);
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..f3c0ef6 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int tickets;
++  int rounds;
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..f13e9fb 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -94,6 +94,7 @@ extern uint64 sys_getpid(void);
+ extern uint64 sys_sbrk(void);
+ extern uint64 sys_pause(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_settickets(void);
+ extern uint64 sys_open(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_mknod(void);
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets] sys_settickets,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..956186d 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_ps     22
++#define SYS_settickets 23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..3064d45 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -95,6 +95,20 @@ sys_kill(void)
+   return kkill(pid);
+ }
+ 
++uint64
++sys_settickets(void)
++{
++  int n;
++  argint(0, &n);
++  if(n <= 0)
++    return -1;
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  p->tickets = n;
++  release(&p->lock);
++  return 0;
++}
++
+ // return how many clock tick interrupts have occurred
+ // since start.
+ uint64
+diff --git a/scripts/run_scheduler_test.expect b/scripts/run_scheduler_test.expect
+new file mode 100755
+index 0000000..9103abe
+--- /dev/null
++++ b/scripts/run_scheduler_test.expect
+@@ -0,0 +1,29 @@
++#!/usr/bin/expect -f
++set timeout 60
++spawn make qemu
++
++expect {
++    -re "\$ $" { }
++    timeout { puts "Timeout waiting for shell prompt"; exit 1 }
++}
++
++send "test_scheduler 10 &\r"
++send "test_scheduler 5 &\r"
++send "test_scheduler 2 &\r"
++
++sleep 2
++
++send "\x10"
++sleep 1
++send "\x10"
++sleep 1
++
++sleep 1
++
++send "\003"
++
++expect {
++    eof {}
++}
++
++exit 0
+diff --git a/scripts/run_scheduler_test.py b/scripts/run_scheduler_test.py
+new file mode 100755
+index 0000000..42f7aca
+--- /dev/null
++++ b/scripts/run_scheduler_test.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++import pexpect, sys, time
++
++cmd = 'make qemu'
++child = pexpect.spawn(cmd, encoding='utf-8', timeout=60)
++
++try:
++    child.expect_exact('$ ', timeout=60)
++except pexpect.TIMEOUT:
++    print('Timeout waiting for shell prompt', file=sys.stderr)
++    child.kill(0)
++    sys.exit(1)
++
++child.sendline('test_scheduler 10 &')
++child.sendline('test_scheduler 5 &')
++child.sendline('test_scheduler 2 &')
++
++time.sleep(2)
++
++child.send('\x10')
++time.sleep(1)
++child.send('\x10')
++time.sleep(1)
++
++out = ''
++try:
++    while True:
++        out += child.read_nonblocking(size=1024, timeout=0.5)
++except (pexpect.TIMEOUT, pexpect.EOF):
++    pass
++
++print('=== Captured output (tail): ===')
++print('\n'.join(out.splitlines()[-60:]))
++
++try:
++    child.send('\x03')
++except Exception:
++    pass
++child.expect(pexpect.EOF, timeout=10)
++
++sys.exit(0)
+diff --git a/user/addDemo.c b/user/addDemo.c
+new file mode 100644
+index 0000000..6ef1b01
+--- /dev/null
++++ b/user/addDemo.c
+@@ -0,0 +1,8 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(){
++int add = 2+3;
++printf("add: %d\n",add);
++return 0;
++}
+\ No newline at end of file
+diff --git a/user/add_with_arg.c b/user/add_with_arg.c
+new file mode 100644
+index 0000000..631eb98
+--- /dev/null
++++ b/user/add_with_arg.c
+@@ -0,0 +1,18 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]){
++if(argc < 3){
++printf("Addition failed_____No arguments given_____\n");
++}
++else if(argc == 3){
++int a = atoi(argv[1]);
++int b = atoi(argv[2]);
++int add = a + b;
++printf("addition of 2 inputs %d and %d = %d\n",a,b,add);
++}
++else{
++printf("Addition failed_____Too many arguments given_____\n");
++}
++return 0;
++}
+\ No newline at end of file
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..5d741c8
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,22 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  if(argc != 2){
++    printf("Usage: test_scheduler <tickets>\n");
++    exit(1);
++  }
++
++  int tickets = atoi(argv[1]);
++  if(settickets(tickets) < 0){
++    printf("settickets failed\n");
++    exit(1);
++  }
++
++  while(1) ;
++
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index ac84de9..4c6be50 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -21,6 +21,7 @@ int mkdir(const char*);
+ int chdir(const char*);
+ int dup(int);
+ int getpid(void);
++int settickets(int);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..087dd83 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("settickets");
